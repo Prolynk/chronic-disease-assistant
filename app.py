@@ -58,7 +58,9 @@ def load_pipeline():
     persistent disk outside the repo.
     Downloads BAAI/bge-small-en-v1.5 from HuggingFace.
     """
+    print("[pipeline] loading embedder...", flush=True)
     embedder = SentenceTransformer(EMBED_MODEL)
+    print("[pipeline] embedder loaded", flush=True)
     db       = chromadb.PersistentClient(path=CHROMA_PATH)
 
     # Check if collection already exists in /tmp/
@@ -79,9 +81,12 @@ def load_pipeline():
                 line = line.strip()
                 if line:
                     chunks.append(json.loads(line))
+        print(f"[pipeline] loaded {len(chunks)} chunks from {CHUNKS_FILE}",
+              flush=True)
 
         # Embed and add in batches of 100
         batch_size = 100
+        n_batches = (len(chunks) + batch_size - 1) // batch_size
         for i in range(0, len(chunks), batch_size):
             batch  = chunks[i:i+batch_size]
             texts  = [c["text"] for c in batch]
@@ -93,6 +98,8 @@ def load_pipeline():
                 "chunk_id": str(c.get("chunk_id", "")),
             } for c in batch]
 
+            print(f"[pipeline] embedding batch {i // batch_size + 1}/"
+                  f"{n_batches}...", flush=True)
             embeddings = embedder.encode(
                 texts,
                 show_progress_bar=False
@@ -104,16 +111,20 @@ def load_pipeline():
                 metadatas=metas,
                 embeddings=embeddings
             )
+        print("[pipeline] index build complete", flush=True)
     else:
         collection = db.get_collection(COLLECTION)
+        print("[pipeline] reusing cached collection", flush=True)
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
+    print(f"[pipeline] OPENAI_API_KEY present: {bool(api_key)}", flush=True)
     llm     = OpenAI(api_key=api_key)
 
     return collection, embedder, llm
 
 def run_query(question, collection, embedder, llm):
     """Embed question, retrieve top-k chunks, generate answer."""
+    print(f"[query] embedding question: {question!r}", flush=True)
     embedding = embedder.encode([question]).tolist()
 
     results = collection.query(
@@ -134,6 +145,7 @@ def run_query(question, collection, embedder, llm):
         )
     context = "\n\n".join(context_parts)
 
+    print("[query] retrieved chunks, calling OpenAI...", flush=True)
     response = llm.chat.completions.create(
         model=LLM_MODEL,
         temperature=LLM_TEMP,
@@ -145,6 +157,7 @@ def run_query(question, collection, embedder, llm):
                          f"\n\nQuestion: {question}")}
         ]
     )
+    print("[query] got OpenAI response", flush=True)
     answer = response.choices[0].message.content
     return answer, docs, metas, distances
 
