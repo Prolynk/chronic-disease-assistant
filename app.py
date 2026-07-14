@@ -1,16 +1,21 @@
 """
-App:     app.py (Hugging Face Spaces deployment)
+App:     app.py (Streamlit Community Cloud deployment)
 Purpose: Streamlit demo of Strategy 1 dense retrieval
          RAG pipeline for chronic disease self-management.
-         Deployed on Hugging Face Spaces, free public URL.
 Project: MSc AI Dissertation, Habeeb Adekeye
          Northumbria University, KF7029
 Note:    ChromaDB index is rebuilt from chunks_v2.jsonl
          on first startup then cached in /tmp/chroma_db/
 """
 
-import streamlit as st
 import os
+
+# hf-xet's fast-download backend hangs indefinitely on Streamlit Cloud's
+# sandboxed network instead of falling back to plain HTTP. Disable it
+# before any huggingface_hub call triggers a model download.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+import streamlit as st
 import json
 import chromadb
 from sentence_transformers import SentenceTransformer
