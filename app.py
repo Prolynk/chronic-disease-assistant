@@ -40,6 +40,7 @@ CHROMA_PATH  = "/tmp/chroma_db"
 CHUNKS_FILE  = "chunks_v2.jsonl"
 COLLECTION   = "strategy1_dense"
 EMBED_MODEL  = "BAAI/bge-small-en-v1.5"
+QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 LLM_MODEL    = "gpt-4o-mini"
 LLM_TEMP     = 0
 LLM_MAX_TOK  = 500
@@ -130,7 +131,27 @@ If one or more facts name a relevant drug, contraindication, cause, or finding, 
 
 Be concise. Do not invent information beyond what the facts state."""
 
+# -- Graph-linearised constants (Strategy 3) -------------
+STRATEGY3_COLLECTION = "strategy3_linearised"
+
+SYSTEM_PROMPT_S3 = """You are a chronic disease self-management assistant answering using ONLY structured knowledge graph facts extracted from UMLS (not clinical guideline text). Facts take the form of (head, relation, tail) statements, e.g. "Metformin may treat Type 2 Diabetes." They were retrieved by semantic search over the knowledge graph, not by looking up a specific entity.
+
+If one or more facts name a relevant drug, contraindication, cause, or finding, state it plainly and attribute it to the knowledge graph (e.g. "According to the knowledge graph, Albuterol may treat Asthma."). Do NOT claim guideline-level status ("first-line", specific dosing, numeric thresholds) unless a fact explicitly states it - these facts describe relationships, not clinical protocols. Only say "I cannot find sufficient information in the knowledge graph to answer this question" if NONE of the retrieved facts are relevant at all.
+
+Because facts are retrieved by semantic similarity rather than precise entity lookup, they may occasionally include two facts that conflict (e.g. one says a drug may treat a condition while another says the same drug is contraindicated for it). If you notice such a conflict among the retrieved facts, explicitly say the knowledge graph contains conflicting information about that point, rather than silently picking one side.
+
+Be concise. Do not invent information beyond what the facts state."""
+
 # -- Load and cache everything --------------------------
+@st.cache_resource(show_spinner="Loading embedding model...")
+def load_embedder():
+    """Shared BGE embedder, cached once and reused by Strategy 1 and 3."""
+    print("[embedder] loading...", flush=True)
+    embedder = SentenceTransformer(EMBED_MODEL)
+    print("[embedder] loaded", flush=True)
+    return embedder
+
+
 @st.cache_resource(show_spinner="Loading knowledge base...")
 def load_pipeline():
     """
@@ -139,9 +160,7 @@ def load_pipeline():
     persistent disk outside the repo.
     Downloads BAAI/bge-small-en-v1.5 from HuggingFace.
     """
-    print("[pipeline] loading embedder...", flush=True)
-    embedder = SentenceTransformer(EMBED_MODEL)
-    print("[pipeline] embedder loaded", flush=True)
+    embedder = load_embedder()
     db       = chromadb.PersistentClient(path=CHROMA_PATH)
 
     # Check if collection already exists in /tmp/
@@ -260,6 +279,70 @@ def load_kg():
           flush=True)
 
     return concepts, graph
+
+
+def build_s3_corpus():
+    """Clean umls_triples.csv the same way as load_kg() (dedupe + relation-
+    tier-exclude) so both KG strategies share the identical fact base -
+    they differ ONLY in retrieval mechanism (graph traversal vs. dense
+    embedding search over these same linearised sentences)."""
+    triples = pd.read_csv(TRIPLES_FILE)
+    triples["relation_label"] = triples["relation_label"].fillna("")
+    triples["linearised"] = triples["linearised"].fillna("")
+    triples = triples.drop_duplicates(subset=["head_cui", "relation_label", "tail_cui"])
+    rel_lower = triples["relation_label"].str.lower()
+    keep_mask = (
+        (~rel_lower.isin(RELATION_TIER_EXCLUDE))
+        & (~rel_lower.str.contains("authorized value"))
+        & (triples["linearised"].str.len() > 0)
+    )
+    triples = triples[keep_mask].copy().reset_index(drop=True)
+    triples["triple_id"] = triples.index.astype(str)
+    return triples
+
+
+@st.cache_resource(show_spinner="Building graph-linearised knowledge base...")
+def load_s3_index(_embed_model):
+    """Build (or reuse) the strategy3_linearised ChromaDB collection,
+    embedding each cleaned linearised KG sentence as its own document."""
+    print("[s3] building corpus...", flush=True)
+    corpus = build_s3_corpus()
+    print(f"[s3] corpus size: {len(corpus)}", flush=True)
+
+    db = chromadb.PersistentClient(path=CHROMA_PATH)
+    existing = [c.name for c in db.list_collections()]
+
+    if STRATEGY3_COLLECTION in existing:
+        collection = db.get_collection(STRATEGY3_COLLECTION)
+        if collection.count() == len(corpus):
+            print("[s3] reusing cached collection", flush=True)
+            return collection
+        db.delete_collection(STRATEGY3_COLLECTION)
+
+    st.info("Building graph-linearised knowledge base, "
+            "this takes about a minute on first run...")
+    collection = db.create_collection(
+        name=STRATEGY3_COLLECTION, metadata={"hnsw:space": "cosine"})
+
+    batch_size = 500
+    n = len(corpus)
+    for i in range(0, n, batch_size):
+        batch = corpus.iloc[i:i + batch_size]
+        texts = batch["linearised"].tolist()
+        ids = batch["triple_id"].tolist()
+        metas = [{
+            "head": str(r["head"]), "relation_label": str(r["relation_label"]),
+            "tail": str(r["tail"]), "sab": str(r["sab"]),
+        } for _, r in batch.iterrows()]
+
+        print(f"[s3] embedding {min(i + batch_size, n)}/{n}...", flush=True)
+        embeddings = _embed_model.encode(
+            texts, show_progress_bar=False, normalize_embeddings=True
+        ).tolist()
+        collection.add(documents=texts, ids=ids, metadatas=metas, embeddings=embeddings)
+
+    print("[s3] index build complete", flush=True)
+    return collection
 
 
 def extract_entities(question, nlp):
@@ -422,6 +505,39 @@ def run_query_kg(question, nlp, concepts, graph, llm):
     answer = response.choices[0].message.content
     return answer, matched_entities, kg_facts, entity_mentions
 
+
+def run_query_s3(question, embed_model, collection, llm):
+    """Strategy 3: dense-retrieve top-k linearised KG sentences (semantic
+    search, NOT entity-linking/traversal), generate grounded answer."""
+    print(f"[s3-query] embedding question: {question!r}", flush=True)
+    qe = embed_model.encode(
+        [QUERY_PREFIX + question], normalize_embeddings=True)[0].tolist()
+    res = collection.query(
+        query_embeddings=[qe], n_results=TOP_K,
+        include=["documents", "metadatas", "distances"]
+    )
+    docs = res["documents"][0]
+    metas = res["metadatas"][0]
+    distances = res["distances"][0]
+    scores = [1 - d for d in distances]
+
+    kg_block = "\n".join(f"- {d}" for d in docs) if docs else "(no matched KG facts)"
+    user_content = f"Knowledge graph facts:\n{kg_block}\n\nQuestion: {question}"
+
+    print("[s3-query] calling OpenAI...", flush=True)
+    response = llm.chat.completions.create(
+        model=LLM_MODEL,
+        temperature=LLM_TEMP,
+        max_tokens=LLM_MAX_TOK,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_S3},
+            {"role": "user", "content": user_content}
+        ]
+    )
+    print("[s3-query] got OpenAI response", flush=True)
+    answer = response.choices[0].message.content
+    return answer, docs, metas, scores
+
 # -- UI --------------------------------------------------
 st.title("🏥 Chronic Disease Self-Management Assistant")
 
@@ -442,22 +558,30 @@ evidence retrieved directly from clinical guidelines:
 
 strategy = st.radio(
     "Retrieval strategy:",
-    ["Strategy 1: Dense Retrieval", "Strategy 2: KG-Only Retrieval"],
+    [
+        "Strategy 1: Dense Retrieval",
+        "Strategy 2: KG-Only Retrieval (Graph Traversal)",
+        "Strategy 3: KG-Only Retrieval (Dense/Linearised)",
+    ],
     horizontal=True,
     help=(
         "Strategy 1 retrieves passages from the guideline PDFs and "
-        "answers from that text alone. Strategy 2 uses ZERO guideline "
-        "text: it extracts entities from your question with scispaCy, "
-        "maps them to a UMLS knowledge graph, and answers using ONLY "
-        "structured graph facts (drug treatments, contraindications, "
-        "etc.). Strategy 2 will often correctly decline to answer "
-        "questions that need clinical protocol detail (numeric "
-        "targets, 'first-line' status, lifestyle advice) that isn't "
-        "represented as a graph relationship - that's an expected "
-        "limitation, not a bug."
+        "answers from that text alone. Strategies 2 and 3 use ZERO "
+        "guideline text - both answer using ONLY structured UMLS "
+        "knowledge graph facts, but via different mechanisms: "
+        "Strategy 2 extracts entities with scispaCy and symbolically "
+        "traverses the graph from them; Strategy 3 embeds every KG "
+        "fact and retrieves by semantic similarity to your question, "
+        "the same mechanism Strategy 1 uses over PDF text. Both KG "
+        "strategies will often correctly decline to answer questions "
+        "that need clinical protocol detail (numeric targets, "
+        "'first-line' status, lifestyle advice) that isn't represented "
+        "as a graph relationship - that's an expected limitation, not "
+        "a bug."
     ),
 )
 is_strategy2 = strategy.startswith("Strategy 2")
+is_strategy3 = strategy.startswith("Strategy 3")
 
 st.divider()
 
@@ -502,11 +626,14 @@ if search_clicked:
     elif not os.environ.get("OPENAI_API_KEY"):
         st.error("OpenAI API key not configured.")
     else:
-        with st.spinner(
-            "Searching guidelines and generating answer..."
-            if not is_strategy2 else
-            "Extracting entities and traversing knowledge graph..."
-        ):
+        if is_strategy2:
+            spinner_text = "Extracting entities and traversing knowledge graph..."
+        elif is_strategy3:
+            spinner_text = "Searching knowledge graph facts and generating answer..."
+        else:
+            spinner_text = "Searching guidelines and generating answer..."
+
+        with st.spinner(spinner_text):
             try:
                 if is_strategy2:
                     nlp = load_ner_model()
@@ -519,7 +646,8 @@ if search_clicked:
                     st.markdown("### 💬 Answer")
                     st.markdown(answer)
                     st.caption(
-                        "⚙️ Grounded solely in UMLS knowledge graph triples. "
+                        "⚙️ Grounded solely in UMLS knowledge graph triples "
+                        "(symbolic entity-linking + graph traversal). "
                         "No guideline PDF text was used for this answer."
                     )
                     st.divider()
@@ -539,6 +667,36 @@ if search_clicked:
                             st.markdown(f"- {f}")
                     else:
                         st.caption("No matching knowledge graph facts found for this question.")
+
+                elif is_strategy3:
+                    embed_model = load_embedder()
+                    collection = load_s3_index(embed_model)
+                    llm = load_llm_client()
+                    answer, docs, metas, scores = run_query_s3(
+                        question, embed_model, collection, llm
+                    )
+
+                    st.markdown("### 💬 Answer")
+                    st.markdown(answer)
+                    st.caption(
+                        "⚙️ Grounded solely in UMLS knowledge graph triples "
+                        "(dense/semantic search over linearised facts). "
+                        "No guideline PDF text was used for this answer."
+                    )
+                    st.divider()
+
+                    st.markdown("### 🧬 Retrieved Knowledge Graph Facts")
+                    st.caption(
+                        "Retrieved by semantic similarity to your question, "
+                        "not by looking up a specific entity:"
+                    )
+                    for i, (doc, meta, score) in enumerate(zip(docs, metas, scores), 1):
+                        with st.expander(
+                            f"📌 [{i}] {meta.get('sab', 'UMLS')}, "
+                            f"Relevance: {round(score, 3)}",
+                            expanded=(i == 1)
+                        ):
+                            st.markdown(doc)
 
                 else:
                     collection, embedder, llm = load_pipeline()
