@@ -1,12 +1,14 @@
 """
 App:     app.py (Streamlit Community Cloud deployment)
 Purpose: Streamlit demo of Strategy 1 (dense retrieval) and
-         Strategy 2 (KG-augmented retrieval) RAG pipelines for
-         chronic disease self-management, selectable at runtime.
+         Strategy 2 (KG-only retrieval) RAG pipelines for chronic
+         disease self-management, selectable at runtime.
 Project: MSc AI Dissertation, Habeeb Adekeye
          Northumbria University, KF7029
-Note:    ChromaDB index is rebuilt from chunks_v2.jsonl
-         on first startup then cached in /tmp/chroma_db/
+Note:    ChromaDB index is rebuilt from chunks_v2.jsonl on first
+         startup then cached in /tmp/chroma_db/. Strategy 2 uses
+         NO PDF text at all - it is grounded solely in UMLS
+         knowledge graph triples, per the project approval form.
 """
 
 import os
@@ -20,6 +22,8 @@ import re
 import streamlit as st
 import json
 import pandas as pd
+import networkx as nx
+import spacy
 import chromadb
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
@@ -57,28 +61,10 @@ context. Do not make up statistics or recommendations.
 Be concise and specific. Cite the source document
 when possible."""
 
-SYSTEM_PROMPT_KG = """You are a chronic disease
-self-management assistant. Your role is to provide
-accurate, evidence-based answers to questions about
-diabetes, hypertension, and asthma management.
-
-You have two sources of grounding: (1) Guideline
-passages retrieved from clinical guideline documents,
-and (2) Structured knowledge graph facts extracted
-from UMLS. Answer ONLY using these two sources. If
-neither contains enough information to answer the
-question, say: "I cannot find sufficient information
-in the guidelines to answer this question."
-
-Do not add information from outside the provided
-sources. Do not make up statistics or recommendations.
-Be concise and specific. Cite the guideline source
-document when using a guideline passage, and note
-when a statement draws on a knowledge graph fact."""
-
-# -- Knowledge graph constants (Strategy 2) --------------
+# -- Knowledge graph constants (Strategy 2, KG-ONLY) -----
 CONCEPTS_FILE = "umls_concepts.csv"
-TRIPLES_FILE = "umls_triples_named_only.csv"
+TRIPLES_FILE = "umls_triples.csv"
+NER_MODEL = "en_core_sci_sm"
 
 MAX_ENTITIES = 5
 MAX_TRIPLES_PER_ENTITY = 5
@@ -86,13 +72,21 @@ MAX_TRIPLES_TOTAL = 15
 MIN_STR_LEN = 4
 EXCLUDE_CUIS = {"C1298908"}  # STR == "No" (SNOMEDCT_US Finding) - false-positive risk
 
+# Taxonomic/structural/mapping relations with near-zero clinical QA value,
+# plus LOINC survey-form artifacts and the generic catch-all "related to".
 RELATION_TIER_EXCLUDE = {
-    "isa", "inverse isa", "has member", "member of",
+    "isa", "inverse isa",
+    "has member", "member of",
+    "is parent of", "has subtype",
+    "is broader than", "is narrower than",
+    "part of", "has part",
     "mapped to", "mapped from", "other mapped to", "other mapped from",
     "subset includes concept", "concept in subset", "was a", "inverse was a",
     "has component", "component of", "has answer", "answer to",
+    "related to",
 }
 
+# Clinically salient relations, preferred over generic filler facts.
 RELATION_TIER_A = {
     "may treat", "may be treated by", "may prevent", "may be prevented by",
     "has contraindicated drug", "contraindicated with disease",
@@ -107,10 +101,11 @@ RELATION_TIER_A = {
     "disease has associated anatomic site", "disease has primary anatomic site",
 }
 
-# Curated colloquial-term -> seed-CUI aliases (see 10_strategy2_kg_augmented.py
-# for why: the concept table's canonical name sometimes picked a formal
-# synonym a real question would never use, e.g. Hypertension's canonical STR
-# is "Hypertensive disease").
+# Curated colloquial-term -> seed-CUI aliases: the concept table's canonical
+# name sometimes picked a formal synonym a real question would never use,
+# e.g. the Hypertension seed CUI's canonical STR is "Hypertensive disease".
+# Also acts as a safety net for scispaCy's lightweight NER model, which has
+# a verified recall gap (it drops "asthma" from "acute asthma symptoms").
 ALIAS_MAP = {
     "type 2 diabetes": "C0011860",
     "type ii diabetes": "C0011860",
@@ -128,6 +123,12 @@ ALIAS_MAP = {
     "high blood pressure": "C0020538",
     "asthma": "C0004096",
 }
+
+SYSTEM_PROMPT_KG = """You are a chronic disease self-management assistant answering using ONLY structured knowledge graph facts extracted from UMLS (not clinical guideline text). Facts take the form of (head, relation, tail) statements, e.g. "Metformin may treat Type 2 Diabetes."
+
+If one or more facts name a relevant drug, contraindication, cause, or finding, state it plainly and attribute it to the knowledge graph (e.g. "According to the knowledge graph, Albuterol may treat Asthma."). Do NOT claim guideline-level status ("first-line", specific dosing, numeric thresholds) unless a fact explicitly states it - these facts describe relationships, not clinical protocols. Only say "I cannot find sufficient information in the knowledge graph to answer this question" if NONE of the facts are relevant at all.
+
+Be concise. Do not invent information beyond what the facts state."""
 
 # -- Load and cache everything --------------------------
 @st.cache_resource(show_spinner="Loading knowledge base...")
@@ -202,9 +203,27 @@ def load_pipeline():
 
     return collection, embedder, llm
 
+
+@st.cache_resource(show_spinner=False)
+def load_llm_client():
+    """Lightweight OpenAI client loader - does NOT touch the ChromaDB
+    index or embedder, so Strategy 2 never pays for Strategy 1's setup."""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    return OpenAI(api_key=api_key)
+
+
+@st.cache_resource(show_spinner="Loading scispaCy model...")
+def load_ner_model():
+    print("[kg] loading scispaCy model...", flush=True)
+    nlp = spacy.load(NER_MODEL)
+    print("[kg] scispaCy model loaded", flush=True)
+    return nlp
+
+
 @st.cache_resource(show_spinner="Loading knowledge graph...")
 def load_kg():
-    """Load concept table + named triples, precompute matcher/ranking structures."""
+    """Load the concept table + full triples file, build a NetworkX graph.
+    KG-ONLY strategy: umls_triples.csv is the sole knowledge source."""
     print("[kg] loading concepts + triples...", flush=True)
     concepts = pd.read_csv(CONCEPTS_FILE)
     concepts["STR"] = concepts["STR"].astype(str)
@@ -227,59 +246,103 @@ def load_kg():
     )
     triples = triples[keep_mask].copy()
     triples["_tier"] = rel_lower[keep_mask].apply(lambda r: 0 if r in RELATION_TIER_A else 1)
-    print(f"[kg] loaded {len(concepts)} concepts, {len(triples)} triples", flush=True)
 
-    return concepts, triples
+    graph = nx.MultiDiGraph()
+    for _, row in triples.iterrows():
+        graph.add_edge(
+            row["head_cui"], row["tail_cui"],
+            relation_label=row["relation_label"],
+            linearised=row["linearised"],
+            tier=int(row["_tier"]),
+        )
+    print(f"[kg] loaded {len(concepts)} concepts, {len(triples)} triples -> "
+          f"graph with {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges",
+          flush=True)
+
+    return concepts, graph
 
 
-def match_entities(question, concepts, max_entities=MAX_ENTITIES):
-    """Span-aware, longest-match-first, word-boundary lexical matching.
+def extract_entities(question, nlp):
+    """scispaCy biomedical NER - returns (text, start_char, end_char) spans."""
+    doc = nlp(question)
+    return [(ent.text, ent.start_char, ent.end_char) for ent in doc.ents]
 
-    Checks the curated ALIAS_MAP first (colloquial disease terms -> seed
-    CUI), then falls back to scanning the full concept table for anything
-    else (drugs, symptoms, other concepts) not already covered.
+
+def map_to_cuis(question, entity_spans, concepts, max_entities=MAX_ENTITIES):
+    """Map scispaCy mentions (+ curated disease-alias safety net) to CUIs
+    in the project's own filtered concept table.
+
+    Span-aware: once a character range in the question is claimed by a
+    match, nothing overlapping it can match again - otherwise "type 2
+    diabetes" and the plain "diabetes" alias fire independently and the
+    noisy generic "Diabetes" CUI the alias map was built to avoid sneaks
+    back in via the second pass.
     """
     matched = []
+    seen_cuis = set()
     consumed_spans = []
 
-    def try_match(phrase, cui, display_name):
-        pattern = re.compile(r"\b" + re.escape(phrase) + r"\b", re.IGNORECASE)
-        m = pattern.search(question)
-        if not m:
-            return False
-        span = m.span()
-        if any(s < span[1] and span[0] < e for s, e in consumed_spans):
-            return False
-        consumed_spans.append(span)
-        matched.append({"cui": cui, "name": display_name})
-        return True
+    def span_free(s, e):
+        return not any(cs < e and s < ce for cs, ce in consumed_spans)
 
     for phrase in sorted(ALIAS_MAP, key=len, reverse=True):
         if len(matched) >= max_entities:
             break
         cui = ALIAS_MAP[phrase]
+        if cui in seen_cuis:
+            continue
+        m = re.search(r"\b" + re.escape(phrase) + r"\b", question, re.IGNORECASE)
+        if not m or not span_free(*m.span()):
+            continue
+        consumed_spans.append(m.span())
         name_rows = concepts.loc[concepts["CUI"] == cui, "STR"]
-        display_name = name_rows.iloc[0] if len(name_rows) else phrase
-        try_match(phrase, cui, display_name)
+        name = name_rows.iloc[0] if len(name_rows) else phrase
+        matched.append({"cui": cui, "name": name})
+        seen_cuis.add(cui)
 
-    if len(matched) < max_entities:
+    for text, start, end in entity_spans:
+        if len(matched) >= max_entities:
+            break
+        if not span_free(start, end):
+            continue
+        span_lower = text.lower().strip()
+        if not span_lower:
+            continue
+        exact = concepts[concepts["STR"].str.lower() == span_lower]
+        if len(exact) and exact.iloc[0]["CUI"] not in seen_cuis:
+            consumed_spans.append((start, end))
+            matched.append({"cui": exact.iloc[0]["CUI"], "name": exact.iloc[0]["STR"]})
+            seen_cuis.add(exact.iloc[0]["CUI"])
+            continue
         for _, row in concepts.iterrows():
-            if len(matched) >= max_entities:
+            if row["CUI"] in seen_cuis:
+                continue
+            if re.search(r"\b" + re.escape(row["STR"]) + r"\b", text, re.IGNORECASE):
+                consumed_spans.append((start, end))
+                matched.append({"cui": row["CUI"], "name": row["STR"]})
+                seen_cuis.add(row["CUI"])
                 break
-            try_match(row["STR"], row["CUI"], row["STR"])
 
-    return matched
+    return matched[:max_entities]
 
 
-def get_kg_facts(matched_entities, triples,
-                  max_total=MAX_TRIPLES_TOTAL, max_per_entity=MAX_TRIPLES_PER_ENTITY):
-    """Round-robin across matched entities' tier-ranked candidate facts, deduped."""
+def traverse_graph(matched_entities, graph,
+                    max_total=MAX_TRIPLES_TOTAL, max_per_entity=MAX_TRIPLES_PER_ENTITY):
+    """1-hop NetworkX traversal from each matched CUI (both edge directions),
+    tier-ranked, round-robin across entities, deduped."""
     per_entity = []
     for ent in matched_entities:
         cui = ent["cui"]
-        cand = triples[(triples["head_cui"] == cui) | (triples["tail_cui"] == cui)]
-        cand = cand.sort_values("_tier", kind="stable").head(max_per_entity)
-        per_entity.append(list(cand["linearised"]))
+        if cui not in graph:
+            per_entity.append([])
+            continue
+        edges = []
+        for _, _tail, data in graph.out_edges(cui, data=True):
+            edges.append((data["tier"], data["linearised"]))
+        for _head, _, data in graph.in_edges(cui, data=True):
+            edges.append((data["tier"], data["linearised"]))
+        edges.sort(key=lambda e: e[0])  # Python sort is stable
+        per_entity.append([e[1] for e in edges[:max_per_entity]])
 
     facts, seen = [], set()
     i = 0
@@ -294,8 +357,8 @@ def get_kg_facts(matched_entities, triples,
     return facts[:max_total]
 
 
-def run_query(question, collection, embedder, llm, concepts=None, triples=None):
-    """Embed question, retrieve top-k chunks, optionally KG-augment, generate answer."""
+def run_query_dense(question, collection, embedder, llm):
+    """Strategy 1: embed question, retrieve top-k guideline chunks, generate."""
     print(f"[query] embedding question: {question!r}", flush=True)
     embedding = embedder.encode([question]).tolist()
 
@@ -317,38 +380,47 @@ def run_query(question, collection, embedder, llm, concepts=None, triples=None):
         )
     context = "\n\n".join(context_parts)
 
-    is_kg = concepts is not None and triples is not None
-    matched_entities, kg_facts = [], []
-    if is_kg:
-        print("[query] matching KG entities...", flush=True)
-        matched_entities = match_entities(question, concepts)
-        kg_facts = get_kg_facts(matched_entities, triples)
-
-    if is_kg:
-        kg_block = "\n".join(f"- {f}" for f in kg_facts) if kg_facts else "(no matched KG facts)"
-        user_content = (
-            f"Guideline passages:\n{context}\n\n"
-            f"Structured knowledge graph facts:\n{kg_block}\n\n"
-            f"Question: {question}"
-        )
-        system_prompt = SYSTEM_PROMPT_KG
-    else:
-        user_content = f"Context:\n{context}\n\nQuestion: {question}"
-        system_prompt = SYSTEM_PROMPT
-
     print("[query] calling OpenAI...", flush=True)
     response = llm.chat.completions.create(
         model=LLM_MODEL,
         temperature=LLM_TEMP,
         max_tokens=LLM_MAX_TOK,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",
+             "content": f"Context:\n{context}\n\nQuestion: {question}"}
         ]
     )
     print("[query] got OpenAI response", flush=True)
     answer = response.choices[0].message.content
-    return answer, docs, metas, distances, matched_entities, kg_facts
+    return answer, docs, metas, distances
+
+
+def run_query_kg(question, nlp, concepts, graph, llm):
+    """Strategy 2: extract entities -> map to CUIs -> traverse graph ->
+    generate, grounded SOLELY in KG triples. Zero PDF text anywhere."""
+    print(f"[kg-query] extracting entities from: {question!r}", flush=True)
+    entity_spans = extract_entities(question, nlp)
+    matched_entities = map_to_cuis(question, entity_spans, concepts)
+    kg_facts = traverse_graph(matched_entities, graph)
+    entity_mentions = [text for text, _s, _e in entity_spans]
+
+    kg_block = "\n".join(f"- {f}" for f in kg_facts) if kg_facts else "(no matched KG facts)"
+    user_content = f"Knowledge graph facts:\n{kg_block}\n\nQuestion: {question}"
+
+    print("[kg-query] calling OpenAI...", flush=True)
+    response = llm.chat.completions.create(
+        model=LLM_MODEL,
+        temperature=LLM_TEMP,
+        max_tokens=LLM_MAX_TOK,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_KG},
+            {"role": "user", "content": user_content}
+        ]
+    )
+    print("[kg-query] got OpenAI response", flush=True)
+    answer = response.choices[0].message.content
+    return answer, matched_entities, kg_facts, entity_mentions
 
 # -- UI --------------------------------------------------
 st.title("🏥 Chronic Disease Self-Management Assistant")
@@ -370,12 +442,19 @@ evidence retrieved directly from clinical guidelines:
 
 strategy = st.radio(
     "Retrieval strategy:",
-    ["Strategy 1: Dense Retrieval", "Strategy 2: KG-Augmented Retrieval"],
+    ["Strategy 1: Dense Retrieval", "Strategy 2: KG-Only Retrieval"],
     horizontal=True,
     help=(
-        "Strategy 1 retrieves passages from the guideline PDFs only. "
-        "Strategy 2 adds structured facts (drug treatments, "
-        "contraindications, etc.) from a UMLS knowledge graph."
+        "Strategy 1 retrieves passages from the guideline PDFs and "
+        "answers from that text alone. Strategy 2 uses ZERO guideline "
+        "text: it extracts entities from your question with scispaCy, "
+        "maps them to a UMLS knowledge graph, and answers using ONLY "
+        "structured graph facts (drug treatments, contraindications, "
+        "etc.). Strategy 2 will often correctly decline to answer "
+        "questions that need clinical protocol detail (numeric "
+        "targets, 'first-line' status, lifestyle advice) that isn't "
+        "represented as a graph relationship - that's an expected "
+        "limitation, not a bug."
     ),
 )
 is_strategy2 = strategy.startswith("Strategy 2")
@@ -425,53 +504,73 @@ if search_clicked:
     else:
         with st.spinner(
             "Searching guidelines and generating answer..."
+            if not is_strategy2 else
+            "Extracting entities and traversing knowledge graph..."
         ):
             try:
-                collection, embedder, llm = load_pipeline()
-                concepts, triples = load_kg() if is_strategy2 else (None, None)
-                answer, docs, metas, distances, matched_entities, kg_facts = run_query(
-                    question, collection, embedder, llm, concepts, triples
-                )
-
-                st.markdown("### 💬 Answer")
-                st.markdown(answer)
-                st.divider()
-
                 if is_strategy2:
+                    nlp = load_ner_model()
+                    concepts, graph = load_kg()
+                    llm = load_llm_client()
+                    answer, matched_entities, kg_facts, entity_mentions = run_query_kg(
+                        question, nlp, concepts, graph, llm
+                    )
+
+                    st.markdown("### 💬 Answer")
+                    st.markdown(answer)
+                    st.caption(
+                        "⚙️ Grounded solely in UMLS knowledge graph triples. "
+                        "No guideline PDF text was used for this answer."
+                    )
+                    st.divider()
+
                     st.markdown("### 🧬 Knowledge Graph Facts Used")
+                    st.caption(
+                        "scispaCy-extracted mentions: "
+                        + (", ".join(entity_mentions) or "(none)")
+                    )
                     if matched_entities:
                         st.caption(
-                            "Matched entities: "
-                            + ", ".join(e["name"] for e in matched_entities)
+                            "Matched UMLS entities: "
+                            + ", ".join(f"{e['name']} ({e['cui']})" for e in matched_entities)
                         )
                     if kg_facts:
                         for f in kg_facts:
                             st.markdown(f"- {f}")
                     else:
                         st.caption("No matching knowledge graph facts found for this question.")
+
+                else:
+                    collection, embedder, llm = load_pipeline()
+                    answer, docs, metas, distances = run_query_dense(
+                        question, collection, embedder, llm
+                    )
+
+                    st.markdown("### 💬 Answer")
+                    st.markdown(answer)
                     st.divider()
 
-                st.markdown("### 📄 Retrieved Evidence")
-                st.caption(
-                    "The answer was grounded in these "
-                    "guideline sections:"
-                )
-                for i, (doc, meta, dist) in enumerate(
-                        zip(docs, metas, distances), 1):
-                    source  = meta.get("source", "Unknown")
-                    page    = meta.get("page", "?")
-                    disease = meta.get("disease", "?")
-                    score   = round(1 - float(dist), 3)
-                    with st.expander(
-                        f"📌 [{i}] {source}, "
-                        f"Page {page}, "
-                        f"Relevance: {score}",
-                        expanded=(i == 1)
-                    ):
-                        st.caption(
-                            f"Disease domain: **{disease}**"
-                        )
-                        st.markdown(doc)
+                    st.markdown("### 📄 Retrieved Evidence")
+                    st.caption(
+                        "The answer was grounded in these "
+                        "guideline sections:"
+                    )
+                    for i, (doc, meta, dist) in enumerate(
+                            zip(docs, metas, distances), 1):
+                        source  = meta.get("source", "Unknown")
+                        page    = meta.get("page", "?")
+                        disease = meta.get("disease", "?")
+                        score   = round(1 - float(dist), 3)
+                        with st.expander(
+                            f"📌 [{i}] {source}, "
+                            f"Page {page}, "
+                            f"Relevance: {score}",
+                            expanded=(i == 1)
+                        ):
+                            st.caption(
+                                f"Disease domain: **{disease}**"
+                            )
+                            st.markdown(doc)
 
             except Exception as e:
                 st.error(f"An error occurred: {e}")
